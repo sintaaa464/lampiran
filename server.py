@@ -1,7 +1,6 @@
 from datetime import datetime
 import os
 import time
-
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +18,8 @@ import requests
 SEQUENTIAL_WINDOW = 10  # Fitur lag 1-10 menit
 ROLLING_WINDOW_1H = 60  # Rolling mean 1 jam
 BATAS_KEKERINGAN_KRITIS = 50.0  # Threshold kekeringan tanah (%)
-MAX_PREDICTION_MINUTES = 720.0  # Maksimal estimasi 12 jam (720 menit)
+MAX_PREDICTION_MINUTES = 720.0  # Maksimal estimasi AI: 12 jam (720 menit)
+BATAS_TELEGRAM_MINUTES = 360.0  # Telegram baru kirim jika prediksi <= 6 jam (360 menit)
 INTERVAL_PREDIKSI_MENIT = 30  # AI berjalan tiap 30 menit
 
 MODEL_FILE = "xgboost_drought_model.joblib"
@@ -59,6 +59,9 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 )
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8734016764")
 
+# Tracker waktu pengiriman Telegram per device {device_id: timestamp_terakhir_kirim}
+last_telegram_sent = {}
+
 # ==============================================================================
 # 2. INISIALISASI FASTAPI & DATABASE
 # ==============================================================================
@@ -83,10 +86,8 @@ db_pool = mysql.connector.pooling.MySQLConnectionPool(
     database="db_monitoring_nilam",
 )
 
-
 def get_db():
     return db_pool.get_connection()
-
 
 # ==============================================================================
 # 3. HELPER FUNCTIONS
@@ -102,12 +103,33 @@ def format_waktu(est_menit):
 
 
 def kirim_telegram(device_id, soil, temp, hum, timestamp, est_menit):
-    if est_menit >= MAX_PREDICTION_MINUTES and soil >= BATAS_KEKERINGAN_KRITIS:
+    global last_telegram_sent
+
+    # 1. SYARAT TELEGRAM: Hanya kirim jika prediksi <= 6 jam (360 menit) ATAU tanah SUDAH kritis (<50%)
+    if est_menit > BATAS_TELEGRAM_MINUTES and soil >= BATAS_KEKERINGAN_KRITIS:
+        # Jika estimasi masih > 6 jam, abaikan pengiriman Telegram
+        if device_id in last_telegram_sent:
+            del last_telegram_sent[device_id]  # Reset tracker jika kondisi kembali aman
         return
 
+    # 2. JEDA SPAM 6 JAM: Mencegah pesan terkirim berulang kali dalam jeda 6 jam (21.600 detik)
+    SECS_IN_6_HOURS = 6 * 3600
+    sekarang_ts = time.time()
+
+    if device_id in last_telegram_sent:
+        selisih_detik = sekarang_ts - last_telegram_sent[device_id]
+        if selisih_detik < SECS_IN_6_HOURS:
+            sisa_menit = int((SECS_IN_6_HOURS - selisih_detik) // 60)
+            print(
+                f"[TELEGRAM SKIPPED] Device {device_id} masuk kriteria (<=6 jam), tetapi dibatasi jeda kirim. "
+                f"Sisa waktu tunggu: ~{sisa_menit} menit."
+            )
+            return
+
+    # 3. Susun Format Pesan
     durasi_str = format_waktu(est_menit)
     if soil < BATAS_KEKERINGAN_KRITIS:
-        status_txt = f"🚨 STATUS: Kelembapan tanah SUDAH KRITIS (<{BATAS_KEKERINGAN_KRITIS:.0f}%)\n"
+        status_txt = f"🚨 STATUS: Kelembapan tanah SUDAH KRITIS (<{BATAS_KEKERINGAN_KRITIS:.0f}%)!\n"
         aksi_txt = "Tanah dalam kondisi sangat kering. SEGERA PENYIRAMAN!"
     else:
         status_txt = f"⏳ PREDIKSI: Diprediksi KEKERINGAN dalam {durasi_str}\n"
@@ -122,22 +144,25 @@ def kirim_telegram(device_id, soil, temp, hum, timestamp, est_menit):
         f"{status_txt}\n💦 TINDAKAN:\n{aksi_txt}"
     )
 
+    # 4. Kirim Request ke Telegram API
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": int(TELEGRAM_CHAT_ID.strip()),
-                "text": pesan,
-            },
-            timeout=10,
-        )
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN.strip()}/sendMessage"
+        payload = {
+            "chat_id": int(TELEGRAM_CHAT_ID.strip()),
+            "text": pesan,
+        }
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            last_telegram_sent[device_id] = sekarang_ts
+            print(f"[TELEGRAM SUCCESS] Notifikasi berhasil dikirim ke Device {device_id}.")
+        else:
+            print(f"[TELEGRAM ERROR] HTTP {res.status_code}: {res.text}")
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
 
 
 def ekstrasi_fitur(history):
     """Fungsi internal untuk ekstraksi fitur dari data history MySQL"""
-    # Butuh minimal ROLLING_WINDOW_1H (60 data) agar rolling mean 1 jam akurat
     if len(history) < ROLLING_WINDOW_1H:
         return None
 
@@ -182,7 +207,7 @@ def ekstrasi_fitur(history):
 
     # 4. Sequential / Lag Features (Lag 1-10)
     for lag in range(1, SEQUENTIAL_WINDOW + 1):
-        data[f"soil_lag_{lag:02d}"] = float(soil_series.iloc[-(lag + 1)])
+        data[f"soil_lag_{lag:02d}"] = float(soil_series.iloc[-1 - lag])
 
     return pd.DataFrame([data])[kolom_fitur], latest
 
@@ -198,15 +223,16 @@ def tugas_prediksi_terjadwal():
     cursor = None
     try:
         db = get_db()
-        cursor = db.cursor(dictionary=True)
+        if not db.is_connected():
+            db.reconnect(attempts=3, delay=1)
 
+        cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT DISTINCT device_id FROM sensor_data")
         devices = cursor.fetchall()
 
         for dev in devices:
             dev_id = dev["device_id"]
 
-            # Ambil 61 data terakhir dari MySQL untuk menghitung Rolling 60 & Diff 30
             cursor.execute(
                 """
                 SELECT sensor_id, soil_moisture, temperature, humidity, timestamp 
@@ -224,11 +250,11 @@ def tugas_prediksi_terjadwal():
 
             df_pred, latest = res
 
-            # Prediksi XGBoost langsung (Tanpa expm1 karena target dilatih langsung)
+            # Prediksi XGBoost dipangkas maksimal 12 jam (720 menit)
             pred_raw = float(model.predict(df_pred)[0])
             est_menit = float(np.clip(pred_raw, 0, MAX_PREDICTION_MINUTES))
 
-            # Simpan log prediksi ke DB
+            # Simpan log prediksi ke DB (tetap mencatat hasil prediksi hingga 12 jam)
             cursor.execute(
                 """
                 INSERT INTO prediction_log (sensor_id, estimated_minutes, prediction_time) 
@@ -242,7 +268,7 @@ def tugas_prediksi_terjadwal():
             )
             db.commit()
 
-            # Kirim Telegram
+            # Evaluasi Pengiriman Telegram (akan memfilter jika estimasi <= 6 jam)
             kirim_telegram(
                 dev_id,
                 float(latest["soil_moisture"]),
@@ -332,17 +358,18 @@ def get_sensor(device_id: int = Query(1)):
         )
         data = cursor.fetchone()
 
-        if data:
-            if data.get("timestamp"):
-                data["timestamp"] = data["timestamp"].isoformat()
+        if not data:
+            return {"status": "nodata", "message": "Belum ada data sensor untuk device ini"}
 
-            est_min = data.get("estimated_minutes")
-            data["estimasi_formatted"] = (
-                format_waktu(est_min)
-                if est_min is not None
-                else "Menunggu jadwal prediksi..."
-            )
+        if data.get("timestamp"):
+            data["timestamp"] = data["timestamp"].isoformat()
 
+        est_min = data.get("estimated_minutes")
+        data["estimasi_formatted"] = (
+            format_waktu(est_min)
+            if est_min is not None
+            else "Menunggu jadwal prediksi..."
+        )
         return data
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -395,5 +422,5 @@ def get_sensor_history(device_id: int = Query(1)):
 def home():
     return {
         "status": "running",
-        "service": "FastAPI Single Code (XGBoost 10-Lag & Feature Diff)",
+        "service": "FastAPI Single Code (AI Max 12H, Telegram Trigger <=6H)",
     }
